@@ -20,26 +20,82 @@ if ($API->connect($host, $user, $pass)) {
 // ====== Tambah User ======
 if (isset($_POST['add_user'])) {
     if ($API->connect($host, $user, $pass)) {
-        $API->comm("/ppp/secret/add", [
-            "name"     => $_POST['username'],
-            "password" => $_POST['password'],
-            "profile"  => $_POST['profile']
-        ]);
 
-        // pesan sukses, sertakan profile
-        $message = "✅ User <b>{$_POST['username']}</b> berhasil ditambahkan dengan profile <b>{$_POST['profile']}</b>!<br><br>";
+        $subnet = "11.11.11."; // subnet untuk static VPN
+        $startIp = 10; // mulai dari 11.11.11.10
+        $maxIp   = 254;
 
-        // bikin script konfigurasi client MikroTik (contoh L2TP dengan IPsec)
-        $clientScript = <<<EOT
-# Copy script ini ke MikroTik client
+        // 1. Ambil semua secret yang ada
+        $secrets = $API->comm("/ppp/secret/print");
+
+        // Cari IP yang sudah dipakai
+        $usedIps = [];
+        foreach ($secrets as $s) {
+            if (isset($s['remote-address'])) {
+                $usedIps[] = $s['remote-address'];
+            }
+        }
+
+        // 2. Cari IP kosong berikutnya
+        $newIp = null;
+        for ($i = $startIp; $i <= $maxIp; $i++) {
+            $candidate = $subnet . $i;
+            if (!in_array($candidate, $usedIps)) {
+                $newIp = $candidate;
+                break;
+            }
+        }
+
+        if (!$newIp) {
+            $message = "❌ Gagal menambah user, IP static habis!";
+        } else {
+            // 3. Tambah PPP user dengan remote-address static
+            $API->comm("/ppp/secret/add", [
+                "name"     => $_POST['username'],
+                "password" => $_POST['password'],
+                "profile"  => $_POST['profile'],
+                "remote-address" => $newIp
+            ]);
+
+            // 4. Generate port random NAT
+            $port = rand(20000, 60000);
+
+            // 5. Cek dulu apakah NAT sudah ada untuk user ini
+            $existingNat = $API->comm("/ip/firewall/nat/print", [
+                "?comment" => "VPN-{$_POST['username']}"
+            ]);
+
+            if (empty($existingNat)) {
+                // Kalau belum ada, tambahkan NAT baru
+                $API->comm("/ip/firewall/nat/add", [
+                    "chain"       => "dstnat",
+                    "action"      => "dst-nat",
+                    "dst-address" => "103.195.65.170", // IP publik server
+                    "to-addresses" => $newIp,
+                    "to-ports"    => "8291",
+                    "protocol"    => "tcp",
+                    "dst-port"    => strval($port),
+                    "comment"     => "VPN-{$_POST['username']}"
+                ]);
+            } else {
+                // Kalau sudah ada, pakai port & IP dari rule lama
+                $port   = $existingNat[0]['dst-port'];
+                $newIp  = $existingNat[0]['to-addresses'];
+            }
+
+            // 6. Pesan sukses
+            $message = "✅ User <b>{$_POST['username']}</b> berhasil ditambahkan dengan profile <b>{$_POST['profile']}</b> dan IP <b>{$newIp}</b>!<br><br>";
+            $message .= "🌐 Akses via: <b>{$host}:{$port}</b><br><br>";
+
+            // 7. Script client
+            $clientScript = <<<EOT
 /interface l2tp-client
-add name={$_POST['username']}-vpn connect-to=$host user={$_POST['username']} password={$_POST['password']} \\
-    profile={$_POST['profile']} disabled=no
+add name={$_POST['username']}-vpn connect-to=$host user={$_POST['username']} password={$_POST['password']} disabled=no
 EOT;
 
-        // tampilkan script dalam textarea supaya mudah di-copy
-        $message .= "<b>Script untuk Client:</b><br>
-        <textarea style='width:100%;height:120px;' readonly>$clientScript</textarea>";
+            $message .= "<b>Script untuk Client:</b><br>
+            <textarea style='width:100%;height:120px;' readonly>$clientScript</textarea>";
+        }
 
         $API->disconnect();
     }
@@ -63,17 +119,47 @@ if (isset($_POST['edit_user'])) {
 // ====== Delete User ======
 if (isset($_GET['delete'])) {
     if ($API->connect($host, $user, $pass)) {
-        $API->comm("/ppp/secret/remove", [
-            ".id" => $_GET['delete']
+
+        // 1. Ambil username dulu dari secret id
+        $secret = $API->comm("/ppp/secret/print", [
+            ".proplist" => "name",
+            ".id"       => $_GET['delete']
         ]);
-        $message = "🗑️ User berhasil dihapus!";
+
+        if (!empty($secret)) {
+            $username = $secret[0]['name'];
+
+            // 2. Hapus secret
+            $API->comm("/ppp/secret/remove", [
+                ".id" => $_GET['delete']
+            ]);
+
+            // 3. Ambil semua NAT rules
+            $natRules = $API->comm("/ip/firewall/nat/print");
+
+            if (!empty($natRules)) {
+                foreach ($natRules as $rule) {
+                    if (isset($rule['comment']) && $rule['comment'] === "VPN-$username") {
+                        $API->comm("/ip/firewall/nat/remove", [
+                            ".id" => $rule[".id"]
+                        ]);
+                    }
+                }
+                $message = "🗑️ User <b>$username</b> dan NAT rule terkait berhasil dihapus!";
+            } else {
+                $message = "🗑️ User <b>$username</b> berhasil dihapus, tapi NAT rule tidak ditemukan.";
+            }
+        }
+
         $API->disconnect();
+
         // redirect balik ke halaman utama
         header("Location: " . $_SERVER['PHP_SELF']);
         exit;
     }
 }
 ?>
+
 <!DOCTYPE html>
 <html>
 
@@ -82,14 +168,6 @@ if (isset($_GET['delete'])) {
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
-</head>
-
-<!DOCTYPE html>
-<html>
-
-<head>
-    <title>VPN Manager</title>
-    <script src="https://cdn.tailwindcss.com"></script>
 </head>
 
 <!DOCTYPE html>
@@ -198,12 +276,14 @@ if (isset($_GET['delete'])) {
 
                 if (count($secrets) > 0) {
                     echo "<div class='overflow-x-auto'>
-                      <table class='w-full border border-gray-200'>
+                      <table class='w-full border border-gray-200 text-sm'>
                         <thead class='bg-gray-100'>
                           <tr>
                             <th class='p-2 border'>No</th>
                             <th class='p-2 border'>Username</th>
                             <th class='p-2 border'>Profile</th>
+                            <th class='p-2 border'>Remote Address</th>
+                            <th class='p-2 border'>Akses Via</th>
                             <th class='p-2 border'>Last Logged Out</th>
                             <th class='p-2 border'>Aksi</th>
                           </tr>
@@ -212,10 +292,22 @@ if (isset($_GET['delete'])) {
 
                     $no = 1;
                     foreach ($secrets as $row) {
+                        // Cari Nat rule berdasarkan comment
+                        $natRule = $API->comm("/ip/firewall/nat/print", [
+                            "?comment" => "VPN-" . $row['name']
+                        ]);
+                        $akses = "-";
+                        if (count($natRule) > 0) {
+                            $dstPort = $natRule[0]['dst-port'];
+                            $akses = "{$host}:{$dstPort}";
+                        }
+
                         echo "<tr class='hover:bg-gray-50'>
                           <td class='p-2 border'>" . $no++ . "</td>
                           <td class='p-2 border'>" . $row['name'] . "</td>
                           <td class='p-2 border'>" . $row['profile'] . "</td>
+                          <td class='p-2 border'>" . ($row['remote-address'] ?? '-') . "</td>
+                          <td class='p-2 border text-blue-600 font-medium'>" . $akses . "</td>
                           <td class='p-2 border'>" . ($row['last-logged-out'] ?? '-') . "</td>
                           <td class='p-2 border'>
                             <a href='#' class='bg-yellow-500 text-white px-2 py-1 rounded'
@@ -303,10 +395,16 @@ if (isset($_GET['delete'])) {
                 return;
             }
 
-            let usersHtml = `<div class="bg-white shadow rounded-lg p-6">
+            let usersHtml = `
+            <div class="bg-white shadow rounded-lg p-6">
                 <h3 class="text-lg font-semibold mb-3">PPP Users</h3>
-                <table class="w-full border">
-                    <thead class="bg-gray-100"><tr><th class="border px-3 py-2">User</th><th class="border px-3 py-2">Profile</th></tr></thead>
+                <table class="w-full border text-sm">
+                    <thead class="bg-gray-100">
+                        <tr>
+                            <th class="border px-3 py-2">User</th>
+                            <th class="border px-3 py-2">Profile</th>
+                        </tr>
+                        </thead>
                     <tbody>`;
 
             data.secrets.forEach(u => {
