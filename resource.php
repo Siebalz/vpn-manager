@@ -17,6 +17,7 @@ if ($API->connect($host, $user, $pass)) {
         "free_mem" => round($res['free-memory']/1024/1024,1),
         "total_mem" => round($res['total-memory']/1024/1024,1),
         "uptime" => $res['uptime']
+        
     ]);
 } else {
     echo json_encode(["error" => "Tidak bisa konek ke MikroTik"]);

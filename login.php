@@ -2,8 +2,8 @@
 session_start();
 
 // ganti sesuai kebutuhan
-$valid_user = "admin";
-$valid_pass = "12345";
+$valid_user = "iqbal";
+$valid_pass = "asddsawswsas123";
 
 $message = "";
 

@@ -1,7 +1,25 @@
 <?php
 session_start();
-if (!isset($_SESSION['logged_in']) || $_SESSION['logged_in'] !== true) {
+// kalau belum login, balik ke login.php
+if (!isset($_SESSION['logged_in'])) {
     header("Location: login.php");
+    exit;
+}
+
+// cek apakah router sudah dipilih
+if (!isset($_SESSION['router_id'])) {
+    header("Location: mikrotiks.php");
+    exit;
+}
+
+// proses logout
+if (isset($_POST['logout'])) {
+    // hapus semua session
+    session_unset();
+    session_destroy();
+
+    // balik ke halaman pemilihan router
+    header("Location: mikrotiks.php");
     exit;
 }
 ?>
@@ -9,15 +27,44 @@ if (!isset($_SESSION['logged_in']) || $_SESSION['logged_in'] !== true) {
 require('routeros_api.class.php');
 
 $API = new RouterosAPI();
-$API->port = 5728; // sesuaikan dengan API port
+// Ambil detail router dari session
+$host = $_SESSION['router_host'];
+$user = $_SESSION['router_user'];
+$pass = $_SESSION['router_pass'];
+$port = $_SESSION['router_port'];
 
-$host = 'id-1.routerverse.my.id';
-$user = 'iqbal';
-$pass = 'asddsawswsas123';
+$API = new RouterosAPI();
+$API->port = $port;
 
 $message = "";
 $profiles = [];
 
+
+// ISP1 Traffic Data
+if (isset($_GET['traffic'])) {
+    header('Content-Type: application/json');
+    if ($API->connect($host, $user, $pass)) {
+        $traffic = $API->comm("/interface/print", ["?name" => "ether1-Megavision"]);
+
+        $rx = isset($traffic[0]['rx-byte']) ? $traffic[0]['rx-byte'] : 0;
+        $tx = isset($traffic[0]['tx-byte']) ? $traffic[0]['tx-byte'] : 0;
+
+        if (!isset($_SESSION['last_rx'])) $_SESSION['last_rx'] = $rx;
+        if (!isset($_SESSION['last_tx'])) $_SESSION['last_tx'] = $tx;
+
+        // 🔹 Hitung Mbps
+        $rx_speed = (($rx - $_SESSION['last_rx']) * 8) / 1_000_000;
+        $tx_speed = (($tx - $_SESSION['last_tx']) * 8) / 1_000_000;
+
+        $_SESSION['last_rx'] = $rx;
+        $_SESSION['last_tx'] = $tx;
+
+        echo json_encode(["rx" => round($rx_speed, 2), "tx" => round($tx_speed, 2)]);
+    } else {
+        echo json_encode(["rx" => 0, "tx" => 0]);
+    }
+    exit;
+}
 // Ambil semua profile
 if ($API->connect($host, $user, $pass)) {
     $profiles = $API->comm('/ppp/profile/print');
@@ -179,10 +226,26 @@ if (isset($_GET['delete'])) {
 </head>
 
 <body class="bg-gray-100 text-gray-800 min-h-screen p-6">
-    <div class="flex justify-between items-center mb-6">
-        <h1 class="text-3xl font-bold">VPN Manager</h1>
-        <a href="logout.php" class="bg-red-600 text-white px-4 py-2 rounded hover:bg-red-700">Logout</a>
+    <div class="container mx-auto">
+        <div class="container mx-auto">
+            <h1 class="text-2xl font-bold mb-6">Dashboard VPN Manager</h1>
+
+            <!-- 🔹 Tombol Logout -->
+            <form method="POST">
+                <button type="submit" name="logout"
+                    class="bg-red-600 text-white px-4 py-2 rounded hover:bg-red-700">
+                    Logout
+                </button>
+            </form>
+
+            <!-- 🔹 Informasi Session -->
+            <div class="mt-6 p-4 bg-white shadow rounded">
+                <p>Halo, <strong><?= htmlspecialchars($_SESSION['username']) ?></strong></p>
+                <p>Router aktif: <strong><?= htmlspecialchars($_SESSION['router_host']) ?></strong></p>
+            </div>
+        </div>
     </div>
+    <br>
     <div class="container mx-auto">
         <?php if ($message) { ?>
             <div class="p-4 mb-6 bg-green-100 text-green-700 rounded shadow">
@@ -257,13 +320,13 @@ if (isset($_GET['delete'])) {
                         <p class='text-xl font-bold' id="uptime">-</p>
                     </div>
                 </div>
-            </div>
-        </div>
-
-        <div class="md:col-span-2 mt-6">
-            <h2 class="text-xl font-semibold mb-4">Monitoring Chart</h2>
-            <div class="bg-white p-4 rounded shadow">
-                <canvas id="cpuChart" height="100"></canvas>
+                <!-- Traffic ISP1 -->
+                <div class="md:col-span-2 mt-6">
+                    <h2 class="text-lg font-semibold mb-2">Traffic ISP1 (ether1)</h2>
+                    <div class="bg-white p-4 rounded shadow mx-auto w-[600px]">
+                        <canvas id="trafficChart" class="h-[250px] w-full"></canvas>
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -334,47 +397,75 @@ if (isset($_GET['delete'])) {
     </div>
 
     <script>
-        let cpuData = [];
-        let memData = [];
-        let labels = [];
-
         // Setup Chart.js
-        const ctx = document.getElementById('cpuChart').getContext('2d');
-        const cpuChart = new Chart(ctx, {
+        const rxData = [];
+        const txData = [];
+        const labels = [];
+
+        const ctx = document.getElementById('trafficChart').getContext('2d');
+        const trafficChart = new Chart(ctx, {
             type: 'line',
             data: {
                 labels: labels,
                 datasets: [{
-                        label: 'CPU Load (%)',
-                        data: cpuData,
-                        borderColor: 'rgba(75, 192, 192, 1)',
-                        backgroundColor: 'rgba(75, 192, 192, 0.2)',
+                        label: 'RX (Mbps)',
+                        data: rxData,
+                        borderColor: 'blue',
+                        backgroundColor: 'rgba(0,0,255,0.2)',
                         tension: 0.3
                     },
                     {
-                        label: 'Free Memory (MB)',
-                        data: memData,
-                        borderColor: 'rgba(255, 99, 132, 1)',
-                        backgroundColor: 'rgba(255, 99, 132, 0.2)',
+                        label: 'TX (Mbps)',
+                        data: txData,
+                        borderColor: 'red',
+                        backgroundColor: 'rgba(255,0,0,0.2)',
                         tension: 0.3
                     }
                 ]
             },
             options: {
                 responsive: true,
+                maintainAspectRatio: false,
                 scales: {
                     x: {
-                        title: {
-                            display: true,
-                            text: "Waktu"
+                        offset: true, // 🔹 kasih jarak biar tidak mentok
+                        ticks: {
+                            maxRotation: 45,
+                            minRotation: 45
                         }
                     },
                     y: {
-                        beginAtZero: true
+                        beginAtZero: true,
+                        suggestedMax: 2 // 🔹 opsional, kasih ruang atas
+                    }
+                },
+                layout: {
+                    padding: {
+                        right: 20 // 🔹 kasih ruang ekstra kanan
+
                     }
                 }
             }
         });
+
+        async function getTraffic() {
+            const res = await fetch("<?php echo $_SERVER['PHP_SELF']; ?>?traffic=1");
+            const data = await res.json();
+
+            labels.push(new Date().toLocaleTimeString());
+            rxData.push(data.rx);
+            txData.push(data.tx);
+
+            if (labels.length > 20) {
+                labels.shift();
+                rxData.shift();
+                txData.shift();
+            }
+
+            trafficChart.update();
+        }
+
+        setInterval(getTraffic, 2000);
 
         function editUser(id, username, profile) {
             document.getElementById('edit_id').value = id;
